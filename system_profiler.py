@@ -216,6 +216,7 @@ class SystemProfiler:
             'docker_stopped': [],
             'docker_errors': [],
             'docker_resources': [],
+            'docker_ports': [],
             # Kubernetes-specific categories
             'k8s_env': [],
             'k8s_cluster': [],
@@ -225,7 +226,10 @@ class SystemProfiler:
             'k8s_services': [],
             'k8s_storage': [],
             'k8s_events': [],
-            'k8s_summary': []
+            'k8s_summary': [],
+            # Normal mode additional categories
+            'apache_proxy': [],
+            'filesystem': []
         }
         self.is_root = os.geteuid() == 0
 
@@ -686,6 +690,229 @@ class SystemProfiler:
         if not failed_services and not inactive_enabled:
             self.add_result('systemd_issues', 'success', '✓', "All enabled systemd services are running")
 
+    def check_apache_reverse_proxy(self):
+        """Validate Apache reverse proxy configuration and backend connectivity"""
+        # Find Apache config files
+        config_file = None
+        for path in SERVICES['apache']['config_paths']:
+            if os.path.exists(path):
+                config_file = path
+                break
+
+        if not config_file:
+            return
+
+        # Gather all config content (main + includes)
+        all_configs = []
+
+        try:
+            with open(config_file, 'r') as f:
+                all_configs.append((config_file, f.read(10000)))
+        except (IOError, PermissionError):
+            return
+
+        # Check common include directories
+        include_dirs = [
+            '/etc/apache2/sites-enabled/',
+            '/etc/httpd/conf.d/',
+            '/etc/apache2/conf-enabled/'
+        ]
+        for inc_dir in include_dirs:
+            if os.path.isdir(inc_dir):
+                try:
+                    for fname in os.listdir(inc_dir):
+                        fpath = os.path.join(inc_dir, fname)
+                        if os.path.isfile(fpath) and fname.endswith('.conf'):
+                            try:
+                                with open(fpath, 'r') as f:
+                                    all_configs.append((fpath, f.read(10000)))
+                            except (IOError, PermissionError):
+                                pass
+                except (IOError, PermissionError):
+                    pass
+
+        # Parse ProxyPass directives
+        proxy_pattern = re.compile(
+            r'^\s*ProxyPass\s+\S+\s+(https?://[\w\.\-]+(?::(\d+))?(?:/\S*)?)',
+            re.IGNORECASE | re.MULTILINE
+        )
+
+        proxy_backends = []
+        for conf_path, content in all_configs:
+            for match in proxy_pattern.finditer(content):
+                backend_url = match.group(1)
+                port = match.group(2)
+                host_match = re.search(r'https?://([\w\.\-]+)', backend_url)
+                if host_match:
+                    host = host_match.group(1)
+                    if not port:
+                        port = '443' if backend_url.startswith('https') else '80'
+                    proxy_backends.append({
+                        'url': backend_url,
+                        'host': host,
+                        'port': int(port),
+                        'config_file': conf_path
+                    })
+
+        if not proxy_backends:
+            return
+
+        # Test connectivity to each backend
+        for backend in proxy_backends:
+            try:
+                sock = socket.create_connection(
+                    (backend['host'], backend['port']),
+                    timeout=3
+                )
+                sock.close()
+                self.add_result('apache_proxy', 'success', '✓',
+                    f"ProxyPass -> {backend['url']} - Reachable")
+            except (socket.timeout, socket.error, OSError):
+                self.add_result('apache_proxy', 'critical', '🔴',
+                    f"ProxyPass -> {backend['url']} - UNREACHABLE (from {backend['config_file']})")
+
+        # Cross-reference with Docker container ports if docker is available
+        docker_check = self.run_command('which docker 2>/dev/null')
+        if docker_check:
+            docker_ports_output = self.run_command(
+                'docker ps --format "{{.Names}}|{{.Ports}}" 2>/dev/null',
+                timeout=10
+            )
+            if docker_ports_output:
+                exposed_ports = set()
+                for line in docker_ports_output.split('\n'):
+                    if not line.strip():
+                        continue
+                    port_matches = re.findall(r':(\d+)->', line)
+                    for p in port_matches:
+                        exposed_ports.add(int(p))
+
+                for backend in proxy_backends:
+                    if backend['host'] in ('localhost', '127.0.0.1', '::1'):
+                        if backend['port'] not in exposed_ports:
+                            self.add_result('apache_proxy', 'warning', '⚠',
+                                f"ProxyPass port {backend['port']} ({backend['url']}) "
+                                f"not found in Docker exposed ports")
+
+    def check_apache_error_logs(self):
+        """Analyze Apache error logs for proxy backend connection failures"""
+        log_paths = [
+            '/var/log/apache2/error.log',
+            '/var/log/httpd/error_log',
+            '/var/log/apache2/error_log',
+            '/var/log/httpd/error.log'
+        ]
+
+        log_file = None
+        for path in log_paths:
+            if os.path.exists(path) and os.access(path, os.R_OK):
+                log_file = path
+                break
+
+        if not log_file:
+            return
+
+        log_content = self.run_command(
+            f'tail -500 {log_file} 2>/dev/null',
+            timeout=10
+        )
+        if not log_content:
+            return
+
+        # Search for AH01102: proxy backend connection refused
+        ah01102_pattern = re.compile(
+            r'AH01102.*?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?::\d+)?|\S+:\d+)'
+        )
+
+        occurrences = []
+        for line in log_content.split('\n'):
+            if 'AH01102' in line:
+                match = ah01102_pattern.search(line)
+                backend = match.group(1) if match else 'unknown backend'
+                ts_match = re.match(r'\[([^\]]+)\]', line)
+                timestamp = ts_match.group(1) if ts_match else ''
+                occurrences.append({
+                    'backend': backend,
+                    'timestamp': timestamp
+                })
+
+        if not occurrences:
+            return
+
+        unique_backends = set(o['backend'] for o in occurrences)
+        self.add_result('apache_proxy', 'warning', '⚠',
+            f"Found {len(occurrences)} proxy connection refused errors (AH01102) in {log_file}")
+
+        for backend in unique_backends:
+            count = sum(1 for o in occurrences if o['backend'] == backend)
+            self.add_result('apache_proxy', 'critical', '🔴',
+                f"Backend {backend}: {count} connection refused error(s)")
+
+        if occurrences[-1]['timestamp']:
+            self.add_result('apache_proxy', 'info', 'ℹ',
+                f"Most recent: {occurrences[-1]['timestamp']}")
+
+    def check_filesystem_health(self):
+        """Check filesystem health via dmesg errors and read-only mount detection"""
+        # Part A: Parse dmesg for ext4/xfs errors
+        dmesg_output = self.run_command(
+            'dmesg --level=err,warn 2>/dev/null | grep -iE "(ext4|xfs).*error" | tail -10',
+            timeout=10
+        )
+        if dmesg_output and dmesg_output.strip():
+            error_lines = [l for l in dmesg_output.split('\n') if l.strip()]
+            self.add_result('filesystem', 'critical', '🔴',
+                f"Filesystem errors detected in dmesg ({len(error_lines)} message(s))")
+            for line in error_lines[:5]:
+                clean_line = line.strip()
+                if len(clean_line) > 150:
+                    clean_line = clean_line[:150] + '...'
+                self.add_result('filesystem', 'info', 'ℹ', f"  {clean_line}")
+
+        # Part B: Detect read-only mounted filesystems
+        mount_content = None
+        if os.path.exists('/proc/mounts'):
+            try:
+                with open('/proc/mounts', 'r') as f:
+                    mount_content = f.read()
+            except (IOError, PermissionError):
+                pass
+
+        if not mount_content:
+            mount_content = self.run_command('mount')
+
+        if mount_content:
+            skip_fs = {
+                'proc', 'sysfs', 'devpts', 'tmpfs', 'devtmpfs',
+                'cgroup', 'cgroup2', 'pstore', 'securityfs',
+                'debugfs', 'configfs', 'fusectl', 'mqueue',
+                'hugetlbfs', 'binfmt_misc', 'tracefs', 'bpf',
+                'autofs', 'efivarfs', 'ramfs', 'squashfs',
+                'iso9660', 'udf', 'overlay'
+            }
+
+            for line in mount_content.split('\n'):
+                if not line.strip():
+                    continue
+
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+
+                # /proc/mounts format: device mountpoint fstype options ...
+                device = parts[0]
+                mountpoint = parts[1]
+                fstype = parts[2]
+                options = parts[3]
+
+                if fstype in skip_fs:
+                    continue
+
+                option_list = options.split(',')
+                if 'ro' in option_list:
+                    self.add_result('filesystem', 'critical', '🔴',
+                        f"READ-ONLY: {mountpoint} ({device}, {fstype})")
+
     def check_docker_details(self):
         """Detailed Docker diagnostics (--docker flag)"""
 
@@ -706,6 +933,29 @@ class SystemProfiler:
         version = self.run_command('docker --version 2>/dev/null')
         if version:
             self.add_result('docker_service', 'success', '✓', f"Docker Engine: {version}")
+
+        # Docker API version mismatch check
+        api_versions = self.run_command(
+            'docker version --format "{{.Client.APIVersion}}|{{.Server.APIVersion}}" 2>/dev/null',
+            timeout=10
+        )
+        if api_versions and '|' in api_versions:
+            api_parts = api_versions.split('|')
+            if len(api_parts) == 2:
+                client_api = api_parts[0].strip()
+                server_api = api_parts[1].strip()
+                try:
+                    client_ver = tuple(int(x) for x in client_api.split('.'))
+                    server_ver = tuple(int(x) for x in server_api.split('.'))
+                    if client_ver > server_ver:
+                        self.add_result('docker_service', 'warning', '⚠',
+                            f"API Version Mismatch: Client ({client_api}) > Server ({server_api}) - may cause compatibility issues")
+                    else:
+                        self.add_result('docker_service', 'success', '✓',
+                            f"API Versions: Client {client_api}, Server {server_api}")
+                except (ValueError, TypeError):
+                    self.add_result('docker_service', 'info', '✓',
+                        f"API Versions: Client {client_api}, Server {server_api}")
 
         # Docker socket accessibility
         socket_path = '/var/run/docker.sock'
@@ -786,9 +1036,31 @@ class SystemProfiler:
                     symbol = 'ℹ'
                     msg += " (health: starting)"
 
+                # Check memory limit
+                mem_limit = self.run_command(
+                    f'docker inspect --format "{{{{.HostConfig.Memory}}}}" {name} 2>/dev/null'
+                )
+                if mem_limit and mem_limit != '0':
+                    try:
+                        mem_bytes = int(mem_limit)
+                        if mem_bytes > 0:
+                            mem_mb = mem_bytes / (1024 * 1024)
+                            if mem_mb >= 1024:
+                                mem_str = f"{mem_mb / 1024:.1f}GB"
+                            else:
+                                mem_str = f"{mem_mb:.0f}MB"
+                            msg += f" [Mem Limit: {mem_str}]"
+                    except (ValueError, TypeError):
+                        pass
+                else:
+                    msg += " [No Mem Limit]"
+
                 self.add_result('docker_containers', severity, symbol, msg)
         else:
             self.add_result('docker_containers', 'info', 'ℹ', "No running containers")
+
+        # Nextcloud AIO mastercontainer health check
+        self.check_nextcloud_aio()
 
         # Stopped containers
         stopped = self.run_command(
@@ -810,13 +1082,21 @@ class SystemProfiler:
 
                     msg = f"{name} ({image}) - {status}"
 
-                    severity = 'info'
-                    symbol = '✗'
-                    if exit_code != '0' and exit_code != 'unknown':
-                        severity = 'warning'
-                        symbol = '⚠'
+                    if exit_code == '137':
+                        self.add_result('docker_stopped', 'critical', '🔴',
+                            f"{msg} [OOM KILLED]")
+                        self.add_result('docker_stopped', 'info', 'ℹ',
+                            f"  Hint: Check memory limits or increase host memory for '{name}'")
+                    elif exit_code == '143':
+                        self.add_result('docker_stopped', 'info', '✗',
+                            f"{msg} [SIGTERM]")
+                    elif exit_code != '0' and exit_code != 'unknown':
+                        self.add_result('docker_stopped', 'warning', '⚠', msg)
+                    else:
+                        self.add_result('docker_stopped', 'info', '✗', msg)
 
-                    self.add_result('docker_stopped', severity, symbol, msg)
+        # Port binding conflict analysis
+        self.check_docker_port_conflicts()
 
         # Docker resources summary
         images_output = self.run_command('docker images --format "{{.Repository}}:{{.Tag}}" 2>/dev/null', timeout=10)
@@ -865,6 +1145,157 @@ class SystemProfiler:
                                 self.add_result('docker_resources', 'warning', '⚠', msg)
                             else:
                                 self.add_result('docker_resources', 'info', '✓', msg)
+
+    def check_nextcloud_aio(self):
+        """Check Nextcloud AIO mastercontainer health"""
+        all_containers = self.run_command(
+            'docker ps -a --format "{{.Names}}|{{.Image}}|{{.Status}}" 2>/dev/null',
+            timeout=10
+        )
+        if not all_containers:
+            return
+
+        for line in all_containers.split('\n'):
+            if not line.strip():
+                continue
+            parts = line.split('|')
+            if len(parts) < 3:
+                continue
+
+            name = parts[0]
+            image = parts[1]
+            status = parts[2]
+
+            if 'nextcloud-aio-mastercontainer' not in name:
+                continue
+
+            # Found mastercontainer
+            base_msg = f"Nextcloud AIO: {name} ({image}) - {status}"
+
+            # Check for restarting state
+            if 'Restarting' in status:
+                self.add_result('docker_containers', 'critical', '🔴',
+                    f"{base_msg} [RESTART LOOP]")
+                self.add_result('docker_containers', 'info', 'ℹ',
+                    f"  Check logs: docker logs {name}")
+                return
+
+            # Check health status via inspect
+            health = self.run_command(
+                f'docker inspect --format "{{{{.State.Health.Status}}}}" {name} 2>/dev/null'
+            )
+            if health == 'unhealthy':
+                self.add_result('docker_containers', 'critical', '🔴',
+                    f"{base_msg} [UNHEALTHY]")
+                self.add_result('docker_containers', 'info', 'ℹ',
+                    f"  Check logs: docker logs {name} --tail 50")
+                return
+
+            # Check exit codes for stopped mastercontainer
+            exit_match = re.search(r'Exited \((\d+)\)', status)
+            if exit_match:
+                code = exit_match.group(1)
+                if code == '0':
+                    self.add_result('docker_containers', 'info', '✗',
+                        f"{base_msg} [Clean shutdown]")
+                elif code == '137':
+                    self.add_result('docker_containers', 'critical', '🔴',
+                        f"{base_msg} [OOM KILLED - Exit 137]")
+                elif code == '143':
+                    self.add_result('docker_containers', 'warning', '⚠',
+                        f"{base_msg} [SIGTERM - Exit 143]")
+                else:
+                    self.add_result('docker_containers', 'warning', '⚠',
+                        f"{base_msg} [Exit {code}]")
+                return
+
+            # Running and healthy
+            if health == 'healthy':
+                self.add_result('docker_containers', 'success', '✓',
+                    f"{base_msg} [Healthy]")
+            else:
+                self.add_result('docker_containers', 'success', '✓', base_msg)
+            return
+
+    def check_docker_port_conflicts(self):
+        """Check for port binding conflicts between Docker containers and host services"""
+        containers = self.run_command(
+            'docker ps --format "{{.Names}}" 2>/dev/null',
+            timeout=10
+        )
+        if not containers or not containers.strip():
+            return
+
+        # Collect all port mappings: {host_port: [container_name, ...]}
+        port_map = {}
+
+        for container_name in containers.split('\n'):
+            container_name = container_name.strip()
+            if not container_name:
+                continue
+
+            port_output = self.run_command(
+                f'docker port {container_name} 2>/dev/null',
+                timeout=5
+            )
+            if not port_output:
+                continue
+
+            for port_line in port_output.split('\n'):
+                if not port_line.strip():
+                    continue
+                # Format: "80/tcp -> 0.0.0.0:8080" or "80/tcp -> :::8080"
+                match = re.search(r'->\s+[\d.:]*:(\d+)', port_line)
+                if match:
+                    host_port = match.group(1)
+                    if host_port not in port_map:
+                        port_map[host_port] = []
+                    if container_name not in port_map[host_port]:
+                        port_map[host_port].append(container_name)
+
+        if not port_map:
+            return
+
+        # Check for duplicate container bindings on same host port
+        for port, containers_on_port in port_map.items():
+            if len(containers_on_port) > 1:
+                names = ', '.join(containers_on_port)
+                self.add_result('docker_ports', 'critical', '🔴',
+                    f"Port {port}: CONFLICT - Multiple containers bound: {names}")
+
+        # Check for host process conflicts on mapped ports
+        has_lsof = self.run_command('which lsof 2>/dev/null')
+        if has_lsof:
+            for port in port_map:
+                lsof_output = self.run_command(
+                    f'lsof -i :{port} -sTCP:LISTEN 2>/dev/null',
+                    timeout=5
+                )
+                if not lsof_output:
+                    continue
+
+                # Count distinct non-docker processes
+                non_docker_procs = []
+                for lsof_line in lsof_output.split('\n')[1:]:  # Skip header
+                    if lsof_line.strip():
+                        lsof_parts = lsof_line.split()
+                        if lsof_parts and 'docker' not in lsof_parts[0].lower():
+                            non_docker_procs.append(lsof_parts[0])
+
+                if non_docker_procs:
+                    procs = ', '.join(set(non_docker_procs))
+                    container_names = ', '.join(port_map[port])
+                    self.add_result('docker_ports', 'warning', '⚠',
+                        f"Port {port}: Host process ({procs}) shares port with container(s): {container_names}")
+
+        # If no conflicts found, report clean
+        has_issues = any(
+            sev in ('critical', 'warning')
+            for sev, _, _ in self.results['docker_ports']
+        )
+        if not has_issues and port_map:
+            self.add_result('docker_ports', 'success', '✓',
+                f"No port conflicts detected across {len(port_map)} mapped port(s)")
 
     def check_k8s_details(self):
         """Detailed Kubernetes diagnostics (--k8s flag)"""
@@ -1268,9 +1699,12 @@ class SystemProfiler:
             self.check_services()
             self.detect_cloud_apps()
             self.detect_wordpress_sites()
+            self.check_apache_reverse_proxy()
+            self.check_apache_error_logs()
             self.check_remote_mounts()
             self.check_failed_systemd_services()
             self.check_disk_usage()
+            self.check_filesystem_health()
             self.check_updates()
 
     def display_results(self):
@@ -1338,6 +1772,7 @@ class SystemProfiler:
                 ('docker_errors', 'RECENT ERRORS/WARNINGS'),
                 ('docker_containers', 'RUNNING CONTAINERS'),
                 ('docker_stopped', 'STOPPED CONTAINERS'),
+                ('docker_ports', 'PORT BINDING ANALYSIS'),
                 ('docker_resources', 'DOCKER RESOURCES')
             ]
         else:
@@ -1369,9 +1804,11 @@ class SystemProfiler:
                 ('services', 'SERVICES'),
                 ('cloud_apps', 'CLOUD/WEB APPLICATIONS'),
                 ('wordpress', 'WORDPRESS INSTALLATIONS'),
+                ('apache_proxy', 'APACHE REVERSE PROXY'),
                 ('mounts', 'REMOTE MOUNTS'),
                 ('systemd_issues', 'SYSTEMD SERVICE ISSUES'),
                 ('disk', 'DISK USAGE'),
+                ('filesystem', 'FILESYSTEM HEALTH'),
                 ('updates', 'UPDATES')
             ]
 
